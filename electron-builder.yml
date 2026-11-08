@@ -1,0 +1,71 @@
+# Installers and releases. `npm run dist` builds for this machine; the Release workflow
+# (.github/workflows/release.yml) builds macOS, Windows and Linux and publishes them to GitHub Releases.
+appId: com.lewismilburn.zonekit
+productName: ZoneKit
+copyright: Copyright © Lewis Milburn
+
+directories:
+  output: dist
+  buildResources: assets
+
+files:
+  - out/**
+  # Read at runtime for the window and dock icon, which follows light and dark mode.
+  - assets/favicons/*.png
+  - package.json
+  - "!**/*.map"
+
+publish:
+  provider: github
+  # The Release workflow creates the draft and publishes it once every platform has uploaded.
+  releaseType: draft
+
+mac:
+  category: public.app-category.developer-tools
+  # Icon Composer file (needs Xcode's actool). electron-builder also derives the .icns that older macOS versions use from it.
+  icon: assets/favicons/macos.icon
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+    - target: zip
+      arch: [arm64, x64]
+  hardenedRuntime: true
+  # Signing and notarization run when the CSC_LINK / APPLE_* secrets are set (see release.yml).
+
+win:
+  # Converted to a multi-size .ico at build time.
+  icon: assets/favicons/light.png
+  target:
+    - target: nsis
+      arch: [x64, arm64]
+
+nsis:
+  # A fixed name without spaces, so the release description can link to it (the Release workflow).
+  artifactName: ZoneKit-Setup-${version}.${ext}
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: ZoneKit
+
+linux:
+  icon: assets/favicons/light.png
+  category: Development
+  executableName: zonekit
+  # Shown by package managers for the .deb and .rpm (they require a maintainer).
+  maintainer: Lewis Milburn <dev@lewismilburn.com>
+  target:
+    - target: AppImage
+      arch: [x64, arm64]
+    - target: deb
+      arch: [x64, arm64]
+    - target: rpm
+      arch: [x64, arm64]
+
+# Fixed names (ZoneKit-<version>-x64 / -arm64), so the release description can link to them.
+appImage:
+  artifactName: ZoneKit-${version}-${arch}.${ext}
+deb:
+  artifactName: ZoneKit-${version}-${arch}.${ext}
+rpm:
+  artifactName: ZoneKit-${version}-${arch}.${ext}

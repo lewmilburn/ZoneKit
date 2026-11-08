@@ -1,0 +1,138 @@
+# Builds ZoneKit's installers on macOS, Windows and Linux and publishes them to a GitHub Release.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: Does this version need a release?
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME doesn't match package.json version $version" >&2
+            exit 1
+          fi
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "v$version already has a release (or a draft from a build in progress or one that failed); nothing to do."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$version has no release yet; building it."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create the draft release
+        if: steps.version.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          gh release create "v$version" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --title "ZoneKit $version" --generate-notes
+
+  build:
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # The .rpm is built with rpmbuild, which Ubuntu runners don't have.
+      - name: Install rpm tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y rpm
+
+      - run: npm ci
+
+      - run: npm run build
+
+      # Signing variables are only set when their secrets exist: electron-builder reads an empty
+      # CSC_LINK as a path (the project folder) and fails, so unsigned builds must leave it unset.
+      - name: Build installers and publish to the GitHub Release
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then link="$MAC_CSC_LINK"; password="$MAC_CSC_KEY_PASSWORD"; else link="$WIN_CSC_LINK"; password="$WIN_CSC_KEY_PASSWORD"; fi
+          extra=()
+          if [ -n "$link" ]; then
+            export CSC_LINK="$link" CSC_KEY_PASSWORD="$password"
+          else
+            export CSC_IDENTITY_AUTO_DISCOVERY=false
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              echo "No signing certificate set: ad-hoc signing the Mac app."
+              extra=(-c.mac.identity=-)
+            else
+              echo "No signing certificate set: building unsigned."
+            fi
+          fi
+          if [ "$RUNNER_OS" = "macOS" ] && [ -n "$NOTARIZE_APPLE_ID" ]; then
+            export APPLE_ID="$NOTARIZE_APPLE_ID" APPLE_APP_SPECIFIC_PASSWORD="$NOTARIZE_PASSWORD" APPLE_TEAM_ID="$NOTARIZE_TEAM_ID"
+          fi
+          npx electron-builder --publish always "${extra[@]}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAC_CSC_LINK: ${{ secrets.CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+          NOTARIZE_APPLE_ID: ${{ secrets.APPLE_ID }}
+          NOTARIZE_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          NOTARIZE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      # Download links for each platform go at the top of the description, above GitHub's generated notes.
+      # The file names come from electron-builder.yml (nsis.artifactName and the default mac/linux names).
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ needs.check.outputs.version }}"
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/v$version"
+          {
+            echo "## Download"
+            echo
+            # Linux lines link both architectures: "[ZoneKit-1.0.0-x64.deb](…) · [ZoneKit-1.0.0-arm64.deb](…)".
+            linux() { echo "[ZoneKit-$version-x64.$1]($base/ZoneKit-$version-x64.$1) · [ZoneKit-$version-arm64.$1]($base/ZoneKit-$version-arm64.$1)"; }
+            echo ""
+            echo "- **Windows:** [ZoneKit-Setup-$version.exe]($base/ZoneKit-Setup-$version.exe)"
+            echo ""
+            echo "- **macOS:** [ZoneKit-$version-arm64.dmg]($base/ZoneKit-$version-arm64.dmg)"
+            echo "- **macOS (Intel):** [ZoneKit-$version.dmg]($base/ZoneKit-$version.dmg)"
+            echo ""
+            echo "- **General Linux:** $(linux AppImage)"
+            echo "- **Debian & Ubuntu:** $(linux deb)"
+            echo "- **Fedora:** $(linux rpm)"
+            echo ""
+            gh release view "v$version" --repo "$GITHUB_REPOSITORY" --json body -q .body
+          } > notes.md
+          gh release edit "v$version" --repo "$GITHUB_REPOSITORY" --notes-file notes.md --draft=false --latest
